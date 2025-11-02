@@ -27,6 +27,15 @@ export namespace Plugin {
       $: Bun.$,
     }
     const plugins = [...(config.plugin ?? [])]
+    
+    // SkyCode: Load plugin from environment variable if set (for bundled OpenCode)
+    // This allows SkyCode desktop app to inject its plugin without requiring config files
+    const skycodePluginPath = process.env.SKYCODE_PLUGIN_PATH
+    if (skycodePluginPath) {
+      log.info("loading SkyCode plugin from environment", { path: skycodePluginPath })
+      plugins.push(skycodePluginPath)
+    }
+    
     if (!Flag.OPENCODE_DISABLE_DEFAULT_PLUGINS) {
       plugins.push("opencode-copilot-auth@0.0.3")
       plugins.push("opencode-anthropic-auth@0.0.2")
