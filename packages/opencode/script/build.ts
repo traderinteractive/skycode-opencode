@@ -42,12 +42,24 @@ for (const [os, arch] of targets) {
   const opentui = `@opentui/core-${os === "windows" ? "win32" : os}-${arch.replace("-baseline", "")}`
   await $`mkdir -p ../../node_modules/${opentui}`
   await $`npm pack ${opentui}@${pkg.dependencies["@opentui/core"]}`.cwd(path.join(dir, "../../node_modules"))
-  await $`tar -xf ../../node_modules/${opentui.replace("@opentui/", "opentui-")}-*.tgz -C ../../node_modules/${opentui} --strip-components=1`
+
+  // Find the actual tarball file created by npm pack
+  const opentuiTarballPattern = `${opentui.replace("@opentui/", "opentui-")}-*.tgz`
+  const opentuiFiles = fs.readdirSync(path.join(dir, "../../node_modules"))
+  const opentuiTarball = opentuiFiles.find(f => f.startsWith(opentui.replace("@opentui/", "opentui-")) && f.endsWith(".tgz"))
+  if (!opentuiTarball) throw new Error(`Could not find opentui tarball matching ${opentuiTarballPattern}`)
+  await $`tar -xf ../../node_modules/${opentuiTarball} -C ../../node_modules/${opentui} --strip-components=1`
 
   const watcher = `@parcel/watcher-${os === "windows" ? "win32" : os}-${arch.replace("-baseline", "")}${os === "linux" ? "-glibc" : ""}`
   await $`mkdir -p ../../node_modules/${watcher}`
   await $`npm pack ${watcher}`.cwd(path.join(dir, "../../node_modules")).quiet()
-  await $`tar -xf ../../node_modules/${watcher.replace("@parcel/", "parcel-")}-*.tgz -C ../../node_modules/${watcher} --strip-components=1`
+
+  // Find the actual tarball file created by npm pack
+  const watcherTarballPattern = `${watcher.replace("@parcel/", "parcel-")}-*.tgz`
+  const watcherFiles = fs.readdirSync(path.join(dir, "../../node_modules"))
+  const watcherTarball = watcherFiles.find(f => f.startsWith(watcher.replace("@parcel/", "parcel-")) && f.endsWith(".tgz"))
+  if (!watcherTarball) throw new Error(`Could not find watcher tarball matching ${watcherTarballPattern}`)
+  await $`tar -xf ../../node_modules/${watcherTarball} -C ../../node_modules/${watcher} --strip-components=1`
 
   const parserWorker = fs.realpathSync(path.resolve(dir, "./node_modules/@opentui/core/parser.worker.js"))
   const workerPath = "./src/cli/cmd/tui/worker.ts"
