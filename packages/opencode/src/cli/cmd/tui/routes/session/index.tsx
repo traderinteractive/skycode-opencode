@@ -17,7 +17,14 @@ import { useRoute, useRouteData } from "@tui/context/route"
 import { useSync } from "@tui/context/sync"
 import { SplitBorder } from "@tui/component/border"
 import { useTheme } from "@tui/context/theme"
-import { BoxRenderable, ScrollBoxRenderable, addDefaultParsers } from "@opentui/core"
+import {
+  BoxRenderable,
+  ScrollBoxRenderable,
+  TextAttributes,
+  addDefaultParsers,
+  MacOSScrollAccel,
+  type ScrollAcceleration,
+} from "@opentui/core"
 import { Prompt, type PromptRef } from "@tui/component/prompt"
 import type { AssistantMessage, Part, ToolPart, UserMessage, TextPart, ReasoningPart } from "@opencode-ai/sdk"
 import { useLocal } from "@tui/context/local"
@@ -58,8 +65,19 @@ import { Editor } from "../../util/editor"
 import { Global } from "@/global"
 import fs from "fs/promises"
 import stripAnsi from "strip-ansi"
+import { LSP } from "@/lsp/index.ts"
 
 addDefaultParsers(parsers.parsers)
+
+class CustomSpeedScroll implements ScrollAcceleration {
+  constructor(private speed: number) {}
+
+  tick(_now?: number): number {
+    return this.speed
+  }
+
+  reset(): void {}
+}
 
 const context = createContext<{
   width: number
@@ -94,11 +112,22 @@ export function Session() {
   const sidebarVisible = createMemo(() => sidebar() === "show" || (sidebar() === "auto" && wide()))
   const contentWidth = createMemo(() => dimensions().width - (sidebarVisible() ? 42 : 0) - 4)
 
+  const scrollAcceleration = createMemo(() => {
+    const tui = sync.data.config.tui
+    if (tui?.scroll_acceleration?.enabled) {
+      return new MacOSScrollAccel()
+    }
+    if (tui?.scroll_speed) {
+      return new CustomSpeedScroll(tui.scroll_speed)
+    }
+    return undefined
+  })
+
   createEffect(async () => {
     await sync.session
       .sync(route.sessionID)
       .then(() => {
-        scroll.scrollBy(100_000)
+        if (scroll) scroll.scrollBy(100_000)
       })
       .catch(() => {
         toast.show({
@@ -145,7 +174,7 @@ export function Session() {
 
   function toBottom() {
     setTimeout(() => {
-      scroll.scrollTo(scroll.scrollHeight)
+      if (scroll) scroll.scrollTo(scroll.scrollHeight)
     }, 50)
   }
 
@@ -216,29 +245,33 @@ export function Session() {
         dialog.clear()
       },
     },
-    {
-      title: "Share session",
-      value: "session.share",
-      keybind: "session_share",
-      disabled: !!session()?.share?.url,
-      category: "Session",
-      onSelect: async (dialog) => {
-        await sdk.client.session
-          .share({
-            path: {
-              id: route.sessionID,
+    ...(sync.data.config.share !== "disabled"
+      ? [
+          {
+            title: "Share session",
+            value: "session.share",
+            keybind: "session_share" as const,
+            disabled: !!session()?.share?.url,
+            category: "Session",
+            onSelect: async (dialog: any) => {
+              await sdk.client.session
+                .share({
+                  path: {
+                    id: route.sessionID,
+                  },
+                })
+                .then((res) =>
+                  Clipboard.copy(res.data!.share!.url).catch(() =>
+                    toast.show({ message: "Failed to copy URL to clipboard", variant: "error" }),
+                  ),
+                )
+                .then(() => toast.show({ message: "Share URL copied to clipboard!", variant: "success" }))
+                .catch(() => toast.show({ message: "Failed to share session", variant: "error" }))
+              dialog.clear()
             },
-          })
-          .then((res) =>
-            Clipboard.copy(res.data!.share!.url).catch(() =>
-              toast.show({ message: "Failed to copy URL to clipboard", variant: "error" }),
-            ),
-          )
-          .then(() => toast.show({ message: "Share URL copied to clipboard!", variant: "success" }))
-          .catch(() => toast.show({ message: "Failed to share session", variant: "error" }))
-        dialog.clear()
-      },
-    },
+          },
+        ]
+      : []),
     {
       title: "Unshare session",
       value: "session.unshare",
@@ -679,6 +712,7 @@ export function Session() {
               stickyScroll={true}
               stickyStart="bottom"
               flexGrow={1}
+              scrollAcceleration={scrollAcceleration()}
             >
               <For each={messages()}>
                 {(message, index) => (
@@ -752,7 +786,13 @@ export function Session() {
                         index={index()}
                         onMouseUp={() => {
                           if (renderer.getSelection()?.getSelectedText()) return
-                          dialog.replace(() => <DialogMessage messageID={message.id} sessionID={route.sessionID} />)
+                          dialog.replace(() => (
+                            <DialogMessage
+                              messageID={message.id}
+                              sessionID={route.sessionID}
+                              setPrompt={(promptInfo) => prompt.set(promptInfo)}
+                            />
+                          ))
                         }}
                         message={message as UserMessage}
                         parts={sync.data.part[message.id] ?? []}
@@ -950,14 +990,14 @@ const PART_MAPPING = {
 function ReasoningPart(props: { last: boolean; part: ReasoningPart; message: AssistantMessage }) {
   const { theme, syntax } = useTheme()
   const ctx = use()
+  const content = createMemo(() => props.part.text.trim())
   return (
-    <Show when={props.part.text.trim()}>
+    <Show when={content()}>
       <box
         id={"text-" + props.part.id}
         paddingLeft={2}
         marginTop={1}
-        flexDirection="row"
-        gap={1}
+        flexDirection="column"
         border={["left"]}
         customBorderChars={SplitBorder.customBorderChars}
         borderColor={theme.backgroundElement}
@@ -967,7 +1007,7 @@ function ReasoningPart(props: { last: boolean; part: ReasoningPart; message: Ass
           drawUnstyledText={false}
           streaming={true}
           syntaxStyle={syntax()}
-          content={props.part.text.trim()}
+          content={"_Thinking:_ " + content()}
           conceal={ctx.conceal()}
           fg={theme.text}
         />
@@ -1201,6 +1241,8 @@ ToolRegistry.register<typeof WriteTool>({
         .map((x) => x.toString().padStart(pad, " "))
     })
 
+    const diagnostics = createMemo(() => props.metadata.diagnostics?.[props.input.filePath ?? ""] ?? [])
+
     return (
       <>
         <ToolTitle icon="←" fallback="Preparing write..." when={props.input.filePath}>
@@ -1211,9 +1253,18 @@ ToolRegistry.register<typeof WriteTool>({
             <For each={numbers()}>{(value) => <text style={{ fg: theme.textMuted }}>{value}</text>}</For>
           </box>
           <box paddingLeft={1} flexGrow={1}>
-            <code filetype={filetype(props.input.filePath!)} syntaxStyle={syntax()} content={code()} />
+            <code fg={theme.text} filetype={filetype(props.input.filePath!)} syntaxStyle={syntax()} content={code()} />
           </box>
         </box>
+        <Show when={diagnostics().length}>
+          <For each={diagnostics()}>
+            {(diagnostic) => (
+              <text fg={theme.error}>
+                Error [{diagnostic.range.start.line}:{diagnostic.range.start.character}]: {diagnostic.message}
+              </text>
+            )}
+          </For>
+        </Show>
       </>
     )
   },
@@ -1391,6 +1442,12 @@ ToolRegistry.register<typeof EditTool>({
 
     const ft = createMemo(() => filetype(props.input.filePath))
 
+    createEffect(() => console.log(props.metadata.diagnostics))
+    const diagnostics = createMemo(() => {
+      const arr = props.metadata.diagnostics?.[props.input.filePath ?? ""] ?? []
+      return arr.filter((x) => x.severity === 1).slice(0, 3)
+    })
+
     return (
       <>
         <ToolTitle icon="←" fallback="Preparing edit..." when={props.input.filePath}>
@@ -1406,19 +1463,30 @@ ToolRegistry.register<typeof EditTool>({
           <Match when={diff() && style() === "split"}>
             <box paddingLeft={1} flexDirection="row" gap={2}>
               <box flexGrow={1} flexBasis={0}>
-                <code filetype={ft()} syntaxStyle={syntax()} content={diff()!.oldContent} />
+                <code fg={theme.text} filetype={ft()} syntaxStyle={syntax()} content={diff()!.oldContent} />
               </box>
               <box flexGrow={1} flexBasis={0}>
-                <code filetype={ft()} syntaxStyle={syntax()} content={diff()!.newContent} />
+                <code fg={theme.text} filetype={ft()} syntaxStyle={syntax()} content={diff()!.newContent} />
               </box>
             </box>
           </Match>
           <Match when={code()}>
             <box paddingLeft={1}>
-              <code filetype={ft()} syntaxStyle={syntax()} content={code()} />
+              <code fg={theme.text} filetype={ft()} syntaxStyle={syntax()} content={code()} />
             </box>
           </Match>
         </Switch>
+        <Show when={diagnostics().length}>
+          <box>
+            <For each={diagnostics()}>
+              {(diagnostic) => (
+                <text fg={theme.error}>
+                  Error [{diagnostic.range.start.line + 1}:{diagnostic.range.start.character + 1}] {diagnostic.message}
+                </text>
+              )}
+            </For>
+          </box>
+        </Show>
       </>
     )
   },
@@ -1450,15 +1518,24 @@ ToolRegistry.register<typeof TodoWriteTool>({
   render(props) {
     const { theme } = useTheme()
     return (
-      <box>
-        <For each={props.input.todos ?? []}>
-          {(todo) => (
-            <text style={{ fg: todo.status === "in_progress" ? theme.success : theme.textMuted }}>
-              [{todo.status === "completed" ? "✓" : " "}] {todo.content}
-            </text>
-          )}
-        </For>
-      </box>
+      <>
+        <Show when={!props.input.todos?.length}>
+          <ToolTitle icon="⚙" fallback="Updating todos..." when={true}>
+            Updating todos...
+          </ToolTitle>
+        </Show>
+        <Show when={props.metadata.todos?.length}>
+          <box>
+            <For each={props.input.todos ?? []}>
+              {(todo) => (
+                <text style={{ fg: todo.status === "in_progress" ? theme.success : theme.textMuted }}>
+                  [{todo.status === "completed" ? "✓" : " "}] {todo.content}
+                </text>
+              )}
+            </For>
+          </box>
+        </Show>
+      </>
     )
   },
 })

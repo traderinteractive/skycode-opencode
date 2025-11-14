@@ -190,6 +190,10 @@ export type AgentConfig = {
    */
   description?: string
   mode?: "subagent" | "primary" | "all"
+  /**
+   * Hex color code for the agent (e.g., #FF5733)
+   */
+  color?: string
   permission?: {
     edit?: "ask" | "allow" | "deny"
     bash?:
@@ -297,6 +301,15 @@ export type Config = {
      * TUI scroll speed
      */
     scroll_speed?: number
+    /**
+     * Scroll acceleration settings
+     */
+    scroll_acceleration?: {
+      /**
+       * Enable scroll acceleration
+       */
+      enabled: boolean
+    }
   }
   /**
    * Command configuration, see https://opencode.ai/docs/commands
@@ -1043,6 +1056,7 @@ export type Agent = {
   builtIn: boolean
   topP?: number
   temperature?: number
+  color?: string
   permission: {
     edit: "ask" | "allow" | "deny"
     bash: {
