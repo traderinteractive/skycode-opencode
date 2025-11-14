@@ -54,6 +54,7 @@ git merge upstream/main
 ### 4. Resolve Conflicts (If Any)
 
 If there are conflicts:
+
 ```bash
 # Resolve conflicts in files
 git status  # See conflicted files
@@ -80,6 +81,7 @@ cd skycode-opencode
 ```
 
 **What it does:**
+
 - Checks for upstream remote (adds if missing)
 - Fetches upstream changes
 - Stashes local uncommitted changes (if any)
@@ -90,23 +92,27 @@ cd skycode-opencode
 ## Sync Strategy
 
 ### Recommended Frequency
+
 - **Monthly**: Regular syncs to get upstream bug fixes and features
 - **As Needed**: When upstream releases important features or fixes
 
 ### Branch Strategy
+
 - **dev**: SkyCode's development branch (sync with upstream/main)
 - **main**: Stable branch (sync before releases)
-- **feature/***: Feature branches (sync before merging)
+- **feature/\***: Feature branches (sync before merging)
 
 ### What to Keep in Fork vs. Main Repo
 
 **In Fork (skycode-opencode):**
+
 - ✅ Version pinning/compatibility changes
 - ✅ Major incompatible behavior changes (rare)
 - ✅ OpenCode core modifications needed for SkyCode
 - ✅ Build configuration for bundling
 
 **In Main Repo (skycode):**
+
 - ✅ **All SkyCode plugins** (`packages/opencode-plugin/`)
 - ✅ Plugin loading/integration logic
 - ✅ SkyCode-specific configurations
@@ -116,7 +122,7 @@ cd skycode-opencode
 
 When conflicts occur:
 
-1. **Keep Minimal Changes in Fork**: 
+1. **Keep Minimal Changes in Fork**:
    - Only essential OpenCode core changes
    - Version compatibility fixes
    - Bundling-related modifications
@@ -156,11 +162,13 @@ git diff --stat upstream/main..HEAD
 ## Troubleshooting
 
 ### Upstream Remote Not Found
+
 ```bash
 git remote add upstream https://github.com/sst/opencode.git
 ```
 
 ### Merge Conflicts
+
 ```bash
 # See conflicted files
 git status
@@ -178,11 +186,13 @@ git commit
 If fork has drifted significantly:
 
 1. **Create backup branch**:
+
    ```bash
    git branch backup-before-reset
    ```
 
 2. **Reset to upstream** (if changes are in main repo):
+
    ```bash
    git fetch upstream
    git reset --hard upstream/main
@@ -194,6 +204,7 @@ If fork has drifted significantly:
    - Verify everything still works
 
 ### Stale Remote
+
 ```bash
 # Update remote URL if needed
 git remote set-url upstream https://github.com/sst/opencode.git
@@ -214,6 +225,7 @@ git remote -v
 ## CI/CD Integration (Future)
 
 Consider adding automated sync checks:
+
 - Weekly check for upstream updates
 - Notification when upstream has changes
 - Automated test runs after sync
