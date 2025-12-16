@@ -1,7 +1,7 @@
 import { InputRenderable, RGBA, ScrollBoxRenderable, TextAttributes } from "@opentui/core"
-import { useTheme } from "@tui/context/theme"
+import { useTheme, selectedForeground } from "@tui/context/theme"
 import { entries, filter, flatMap, groupBy, pipe, take } from "remeda"
-import { batch, createEffect, createMemo, For, Show } from "solid-js"
+import { batch, createEffect, createMemo, For, Show, type JSX } from "solid-js"
 import { createStore } from "solid-js/store"
 import { useKeyboard, useTerminalDimensions } from "@opentui/solid"
 import * as fuzzysort from "fuzzysort"
@@ -13,6 +13,7 @@ import { Locale } from "@/util/locale"
 
 export interface DialogSelectProps<T> {
   title: string
+  placeholder?: string
   options: DialogSelectOption<T>[]
   ref?: (ref: DialogSelectRef<T>) => void
   onMove?: (option: DialogSelectOption<T>) => void
@@ -21,6 +22,7 @@ export interface DialogSelectProps<T> {
   keybind?: {
     keybind: Keybind.Info
     title: string
+    disabled?: boolean
     onTrigger: (option: DialogSelectOption<T>) => void
   }[]
   current?: T
@@ -34,6 +36,7 @@ export interface DialogSelectOption<T = any> {
   category?: string
   disabled?: boolean
   bg?: RGBA
+  gutter?: JSX.Element
   onSelect?: (ctx: DialogContext, trigger?: "prompt") => void
 }
 
@@ -50,12 +53,23 @@ export function DialogSelect<T>(props: DialogSelectProps<T>) {
     filter: "",
   })
 
+  createEffect(() => {
+    if (props.current) {
+      const currentIndex = flat().findIndex((opt) => isDeepEqual(opt.value, props.current))
+      if (currentIndex >= 0) {
+        setStore("selected", currentIndex)
+      }
+    }
+  })
+
   let input: InputRenderable
 
   const filtered = createMemo(() => {
     const needle = store.filter.toLowerCase()
-    const result = pipe(props.options, (x) =>
-      !needle ? x : fuzzysort.go(needle, x, { keys: ["title", "category"] }).map((x) => x.obj),
+    const result = pipe(
+      props.options,
+      filter((x) => x.disabled !== true),
+      (x) => (!needle ? x : fuzzysort.go(needle, x, { keys: ["title", "category"] }).map((x) => x.obj)),
     )
     return result
   })
@@ -86,7 +100,14 @@ export function DialogSelect<T>(props: DialogSelectProps<T>) {
 
   createEffect(() => {
     store.filter
-    setStore("selected", 0)
+    if (store.filter.length > 0) {
+      setStore("selected", 0)
+    } else if (props.current) {
+      const currentIndex = flat().findIndex((opt) => isDeepEqual(opt.value, props.current))
+      if (currentIndex >= 0) {
+        setStore("selected", currentIndex)
+      }
+    }
     scroll.scrollTo(0)
   })
 
@@ -94,16 +115,6 @@ export function DialogSelect<T>(props: DialogSelectProps<T>) {
     let next = store.selected + direction
     if (next < 0) next = flat().length - 1
     if (next >= flat().length) next = 0
-
-    // Skip disabled options when flipping through agents
-    let attempts = 0
-    while (flat()[next]?.disabled && attempts < flat().length) {
-      next = next + direction
-      if (next < 0) next = flat().length - 1
-      if (next >= flat().length) next = 0
-      attempts++
-    }
-
     moveTo(next)
   }
 
@@ -134,7 +145,7 @@ export function DialogSelect<T>(props: DialogSelectProps<T>) {
     if (evt.name === "pagedown") move(10)
     if (evt.name === "return") {
       const option = selected()
-      if (option && !option.disabled) {
+      if (option) {
         // evt.preventDefault()
         if (option.onSelect) option.onSelect(dialog)
         props.onSelect?.(option)
@@ -142,9 +153,10 @@ export function DialogSelect<T>(props: DialogSelectProps<T>) {
     }
 
     for (const item of props.keybind ?? []) {
+      if (item.disabled) continue
       if (Keybind.match(item.keybind, keybind.parse(evt))) {
         const s = selected()
-        if (s && !s.disabled) {
+        if (s) {
           evt.preventDefault()
           item.onTrigger(s)
         }
@@ -163,9 +175,11 @@ export function DialogSelect<T>(props: DialogSelectProps<T>) {
   }
   props.ref?.(ref)
 
+  const keybinds = createMemo(() => props.keybind?.filter((x) => !x.disabled) ?? [])
+
   return (
-    <box gap={1}>
-      <box paddingLeft={3} paddingRight={2}>
+    <box gap={1} paddingBottom={1}>
+      <box paddingLeft={4} paddingRight={4}>
         <box flexDirection="row" justifyContent="space-between">
           <text fg={theme.text} attributes={TextAttributes.BOLD}>
             {props.title}
@@ -187,13 +201,13 @@ export function DialogSelect<T>(props: DialogSelectProps<T>) {
               input = r
               setTimeout(() => input.focus(), 1)
             }}
-            placeholder="Enter search term"
+            placeholder={props.placeholder ?? "Search"}
           />
         </box>
       </box>
       <scrollbox
-        paddingLeft={2}
-        paddingRight={2}
+        paddingLeft={1}
+        paddingRight={1}
         scrollbarOptions={{ visible: false }}
         ref={(r: ScrollBoxRenderable) => (scroll = r)}
         maxHeight={height()}
@@ -202,7 +216,7 @@ export function DialogSelect<T>(props: DialogSelectProps<T>) {
           {([category, options], index) => (
             <>
               <Show when={category}>
-                <box paddingTop={index() > 0 ? 1 : 0} paddingLeft={1}>
+                <box paddingTop={index() > 0 ? 1 : 0} paddingLeft={3}>
                   <text fg={theme.accent} attributes={TextAttributes.BOLD}>
                     {category}
                   </text>
@@ -211,26 +225,23 @@ export function DialogSelect<T>(props: DialogSelectProps<T>) {
               <For each={options}>
                 {(option) => {
                   const active = createMemo(() => isDeepEqual(option.value, selected()?.value))
+                  const current = createMemo(() => isDeepEqual(option.value, props.current))
                   return (
                     <box
                       id={JSON.stringify(option.value)}
                       flexDirection="row"
                       onMouseUp={() => {
-                        if (!option.disabled) {
-                          option.onSelect?.(dialog)
-                          props.onSelect?.(option)
-                        }
+                        option.onSelect?.(dialog)
+                        props.onSelect?.(option)
                       }}
                       onMouseOver={() => {
                         const index = filtered().findIndex((x) => isDeepEqual(x.value, option.value))
                         if (index === -1) return
                         moveTo(index)
                       }}
-                      backgroundColor={
-                        active() && !option.disabled ? (option.bg ?? theme.primary) : RGBA.fromInts(0, 0, 0, 0)
-                      }
-                      paddingLeft={1}
-                      paddingRight={1}
+                      backgroundColor={active() ? (option.bg ?? theme.primary) : RGBA.fromInts(0, 0, 0, 0)}
+                      paddingLeft={current() || option.gutter ? 1 : 3}
+                      paddingRight={3}
                       gap={1}
                     >
                       <Option
@@ -238,8 +249,8 @@ export function DialogSelect<T>(props: DialogSelectProps<T>) {
                         footer={option.footer}
                         description={option.description !== category ? option.description : undefined}
                         active={active()}
-                        current={isDeepEqual(option.value, props.current)}
-                        disabled={option.disabled}
+                        current={current()}
+                        gutter={option.gutter}
                       />
                     </box>
                   )
@@ -249,16 +260,20 @@ export function DialogSelect<T>(props: DialogSelectProps<T>) {
           )}
         </For>
       </scrollbox>
-      <box paddingRight={2} paddingLeft={3} flexDirection="row" paddingBottom={1} gap={1}>
-        <For each={props.keybind ?? []}>
-          {(item) => (
-            <text>
-              <span style={{ fg: theme.text, attributes: TextAttributes.BOLD }}>{Keybind.toString(item.keybind)}</span>
-              <span style={{ fg: theme.textMuted }}> {item.title}</span>
-            </text>
-          )}
-        </For>
-      </box>
+      <Show when={keybinds().length} fallback={<box flexShrink={0} />}>
+        <box paddingRight={2} paddingLeft={4} flexDirection="row" gap={2} flexShrink={0} paddingTop={1}>
+          <For each={keybinds()}>
+            {(item) => (
+              <text>
+                <span style={{ fg: theme.text }}>
+                  <b>{item.title}</b>{" "}
+                </span>
+                <span style={{ fg: theme.textMuted }}>{Keybind.toString(item.keybind)}</span>
+              </text>
+            )}
+          </For>
+        </box>
+      </Show>
     </box>
   )
 }
@@ -269,50 +284,39 @@ function Option(props: {
   active?: boolean
   current?: boolean
   footer?: JSX.Element | string
-  disabled?: boolean
+  gutter?: JSX.Element
   onMouseOver?: () => void
 }) {
   const { theme } = useTheme()
-
-  const textColor = props.disabled
-    ? theme.textMuted
-    : props.active
-      ? theme.background
-      : props.current
-        ? theme.primary
-        : theme.text
+  const fg = selectedForeground(theme)
 
   return (
     <>
-      <Show when={props.current && !props.disabled}>
-        <text
-          flexShrink={0}
-          fg={props.active ? theme.background : props.current ? theme.primary : theme.text}
-          marginRight={0.5}
-        >
+      <Show when={props.current}>
+        <text flexShrink={0} fg={props.active ? fg : props.current ? theme.primary : theme.text} marginRight={0.5}>
           ●
         </text>
       </Show>
-      <Show when={props.disabled}>
-        <text flexShrink={0} fg={theme.textMuted} marginRight={0.5}>
-          ○
-        </text>
+      <Show when={!props.current && props.gutter}>
+        <box flexShrink={0} marginRight={0.5}>
+          {props.gutter}
+        </box>
       </Show>
       <text
         flexGrow={1}
-        fg={props.active ? theme.background : props.current ? theme.primary : theme.text}
-        attributes={
-          props.active && !props.disabled ? TextAttributes.BOLD : props.disabled ? TextAttributes.DIM : undefined
-        }
+        fg={props.active ? fg : props.current ? theme.primary : theme.text}
+        attributes={props.active ? TextAttributes.BOLD : undefined}
         overflow="hidden"
-        wrapMode="none"
+        paddingLeft={3}
       >
-        {Locale.truncate(props.title, 62)}
-        <span style={{ fg: props.active ? theme.background : theme.textMuted }}> {props.description}</span>
+        {Locale.truncate(props.title, 61)}
+        <Show when={props.description}>
+          <span style={{ fg: props.active ? fg : theme.textMuted }}> {props.description}</span>
+        </Show>
       </text>
       <Show when={props.footer}>
         <box flexShrink={0}>
-          <text fg={props.active ? theme.background : theme.textMuted}>{props.footer}</text>
+          <text fg={props.active ? fg : theme.textMuted}>{props.footer}</text>
         </box>
       </Show>
     </>

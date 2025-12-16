@@ -7,7 +7,7 @@ import { graphql } from "@octokit/graphql"
 import * as core from "@actions/core"
 import * as github from "@actions/github"
 import type { Context } from "@actions/github/lib/context"
-import type { IssueCommentEvent } from "@octokit/webhooks-types"
+import type { IssueCommentEvent, PullRequestReviewCommentEvent } from "@octokit/webhooks-types"
 import { UI } from "../ui"
 import { cmd } from "./cmd"
 import { ModelsDev } from "../../provider/models"
@@ -124,6 +124,8 @@ type IssueQueryResponse = {
   }
 }
 
+const AGENT_USERNAME = "opencode-agent[bot]"
+const AGENT_REACTION = "eyes"
 const WORKFLOW_FILE = ".github/workflows/opencode.yml"
 
 export const GithubCommand = cmd({
@@ -276,7 +278,7 @@ export const GithubInstallCommand = cmd({
               process.platform === "darwin"
                 ? `open "${url}"`
                 : process.platform === "win32"
-                  ? `start "${url}"`
+                  ? `start "" "${url}"`
                   : `xdg-open "${url}"`
 
             exec(command, (error) => {
@@ -328,6 +330,8 @@ export const GithubInstallCommand = cmd({
 on:
   issue_comment:
     types: [created]
+  pull_request_review_comment:
+    types: [created]
 
 jobs:
   opencode:
@@ -378,7 +382,7 @@ export const GithubRunCommand = cmd({
       const isMock = args.token || args.event
 
       const context = isMock ? (JSON.parse(args.event!) as Context) : github.context
-      if (context.eventName !== "issue_comment") {
+      if (context.eventName !== "issue_comment" && context.eventName !== "pull_request_review_comment") {
         core.setFailed(`Unsupported event type: ${context.eventName}`)
         process.exit(1)
       }
@@ -387,36 +391,53 @@ export const GithubRunCommand = cmd({
       const runId = normalizeRunId()
       const share = normalizeShare()
       const { owner, repo } = context.repo
-      const payload = context.payload as IssueCommentEvent
+      const payload = context.payload as IssueCommentEvent | PullRequestReviewCommentEvent
+      const issueEvent = isIssueCommentEvent(payload) ? payload : undefined
       const actor = context.actor
-      const issueId = payload.issue.number
+
+      const issueId =
+        context.eventName === "pull_request_review_comment"
+          ? (payload as PullRequestReviewCommentEvent).pull_request.number
+          : (payload as IssueCommentEvent).issue.number
       const runUrl = `/${owner}/${repo}/actions/runs/${runId}`
       const shareBaseUrl = isMock ? "https://dev.opencode.ai" : "https://opencode.ai"
 
       let appToken: string
       let octoRest: Octokit
       let octoGraph: typeof graphql
-      let commentId: number
       let gitConfig: string
       let session: { id: string; title: string; version: string }
       let shareId: string | undefined
       let exitCode = 0
       type PromptFiles = Awaited<ReturnType<typeof getUserPrompt>>["promptFiles"]
+      const triggerCommentId = payload.comment.id
+      const useGithubToken = normalizeUseGithubToken()
 
       try {
-        const actionToken = isMock ? args.token! : await getOidcToken()
-        appToken = await exchangeForAppToken(actionToken)
+        if (useGithubToken) {
+          const githubToken = process.env["GITHUB_TOKEN"]
+          if (!githubToken) {
+            throw new Error(
+              "GITHUB_TOKEN environment variable is not set. When using use_github_token, you must provide GITHUB_TOKEN.",
+            )
+          }
+          appToken = githubToken
+        } else {
+          const actionToken = isMock ? args.token! : await getOidcToken()
+          appToken = await exchangeForAppToken(actionToken)
+        }
         octoRest = new Octokit({ auth: appToken })
         octoGraph = graphql.defaults({
           headers: { authorization: `token ${appToken}` },
         })
 
         const { userPrompt, promptFiles } = await getUserPrompt()
-        await configureGit(appToken)
+        if (!useGithubToken) {
+          await configureGit(appToken)
+        }
         await assertPermissions()
 
-        const comment = await createComment()
-        commentId = comment.data.id
+        await addReaction()
 
         // Setup opencode session
         const repoData = await fetchRepo()
@@ -434,7 +455,7 @@ export const GithubRunCommand = cmd({
         // 1. Issue
         // 2. Local PR
         // 3. Fork PR
-        if (payload.issue.pull_request) {
+        if (context.eventName === "pull_request_review_comment" || issueEvent?.issue.pull_request) {
           const prData = await fetchPR()
           // Local PR
           if (prData.headRepository.nameWithOwner === prData.baseRepository.nameWithOwner) {
@@ -448,7 +469,8 @@ export const GithubRunCommand = cmd({
               await pushToLocalBranch(summary, uncommittedChanges)
             }
             const hasShared = prData.comments.nodes.some((c) => c.body.includes(`${shareBaseUrl}/s/${shareId}`))
-            await updateComment(`${response}${footer({ image: !hasShared })}`)
+            await createComment(`${response}${footer({ image: !hasShared })}`)
+            await removeReaction()
           }
           // Fork PR
           else {
@@ -462,7 +484,8 @@ export const GithubRunCommand = cmd({
               await pushToForkBranch(summary, prData, uncommittedChanges)
             }
             const hasShared = prData.comments.nodes.some((c) => c.body.includes(`${shareBaseUrl}/s/${shareId}`))
-            await updateComment(`${response}${footer({ image: !hasShared })}`)
+            await createComment(`${response}${footer({ image: !hasShared })}`)
+            await removeReaction()
           }
         }
         // Issue
@@ -482,9 +505,11 @@ export const GithubRunCommand = cmd({
               summary,
               `${response}\n\nCloses #${issueId}${footer({ image: true })}`,
             )
-            await updateComment(`Created PR #${pr}${footer({ image: true })}`)
+            await createComment(`Created PR #${pr}${footer({ image: true })}`)
+            await removeReaction()
           } else {
-            await updateComment(`${response}${footer({ image: true })}`)
+            await createComment(`${response}${footer({ image: true })}`)
+            await removeReaction()
           }
         }
       } catch (e: any) {
@@ -496,13 +521,16 @@ export const GithubRunCommand = cmd({
         } else if (e instanceof Error) {
           msg = e.message
         }
-        await updateComment(`${msg}${footer()}`)
+        await createComment(`${msg}${footer()}`)
+        await removeReaction()
         core.setFailed(msg)
         // Also output the clean error message for the action to capture
         //core.setOutput("prepare_error", e.message);
       } finally {
-        await restoreGitConfig()
-        await revokeAppToken()
+        if (!useGithubToken) {
+          await restoreGitConfig()
+          await revokeAppToken()
+        }
       }
       process.exit(exitCode)
 
@@ -531,11 +559,58 @@ export const GithubRunCommand = cmd({
         throw new Error(`Invalid share value: ${value}. Share must be a boolean.`)
       }
 
+      function normalizeUseGithubToken() {
+        const value = process.env["USE_GITHUB_TOKEN"]
+        if (!value) return false
+        if (value === "true") return true
+        if (value === "false") return false
+        throw new Error(`Invalid use_github_token value: ${value}. Must be a boolean.`)
+      }
+
+      function isIssueCommentEvent(
+        event: IssueCommentEvent | PullRequestReviewCommentEvent,
+      ): event is IssueCommentEvent {
+        return "issue" in event
+      }
+
+      function getReviewCommentContext() {
+        if (context.eventName !== "pull_request_review_comment") {
+          return null
+        }
+
+        const reviewPayload = payload as PullRequestReviewCommentEvent
+        return {
+          file: reviewPayload.comment.path,
+          diffHunk: reviewPayload.comment.diff_hunk,
+          line: reviewPayload.comment.line,
+          originalLine: reviewPayload.comment.original_line,
+          position: reviewPayload.comment.position,
+          commitId: reviewPayload.comment.commit_id,
+          originalCommitId: reviewPayload.comment.original_commit_id,
+        }
+      }
+
       async function getUserPrompt() {
+        const customPrompt = process.env["PROMPT"]
+        if (customPrompt) {
+          return { userPrompt: customPrompt, promptFiles: [] }
+        }
+
+        const reviewContext = getReviewCommentContext()
         let prompt = (() => {
           const body = payload.comment.body.trim()
-          if (body === "/opencode" || body === "/oc") return "Summarize this thread"
-          if (body.includes("/opencode") || body.includes("/oc")) return body
+          if (body === "/opencode" || body === "/oc") {
+            if (reviewContext) {
+              return `Review this code change and suggest improvements for the commented lines:\n\nFile: ${reviewContext.file}\nLines: ${reviewContext.line}\n\n${reviewContext.diffHunk}`
+            }
+            return "Summarize this thread"
+          }
+          if (body.includes("/opencode") || body.includes("/oc")) {
+            if (reviewContext) {
+              return `${body}\n\nContext: You are reviewing a comment on file "${reviewContext.file}" at line ${reviewContext.line}.\n\nDiff context:\n${reviewContext.diffHunk}`
+            }
+            return body
+          }
           throw new Error("Comments must mention `/opencode` or `/oc`")
         })()
 
@@ -652,7 +727,10 @@ export const GithubRunCommand = cmd({
         try {
           return await chat(`Summarize the following in less than 40 characters:\n\n${response}`)
         } catch (e) {
-          return `Fix issue: ${payload.issue.title}`
+          const title = issueEvent
+            ? issueEvent.issue.title
+            : (payload as PullRequestReviewCommentEvent).pull_request.title
+          return `Fix issue: ${title}`
         }
       }
 
@@ -759,8 +837,8 @@ export const GithubRunCommand = cmd({
 
         await $`git config --local --unset-all ${config}`
         await $`git config --local ${config} "AUTHORIZATION: basic ${newCredentials}"`
-        await $`git config --global user.name "opencode-agent[bot]"`
-        await $`git config --global user.email "opencode-agent[bot]@users.noreply.github.com"`
+        await $`git config --global user.name "${AGENT_USERNAME}"`
+        await $`git config --global user.email "${AGENT_USERNAME}@users.noreply.github.com"`
       }
 
       async function restoreGitConfig() {
@@ -882,24 +960,42 @@ Co-authored-by: ${actor} <${actor}@users.noreply.github.com>"`
         if (!["admin", "write"].includes(permission)) throw new Error(`User ${actor} does not have write permissions`)
       }
 
-      async function createComment() {
+      async function addReaction() {
+        console.log("Adding reaction...")
+        return await octoRest.rest.reactions.createForIssueComment({
+          owner,
+          repo,
+          comment_id: triggerCommentId,
+          content: AGENT_REACTION,
+        })
+      }
+
+      async function removeReaction() {
+        console.log("Removing reaction...")
+        const reactions = await octoRest.rest.reactions.listForIssueComment({
+          owner,
+          repo,
+          comment_id: triggerCommentId,
+          content: AGENT_REACTION,
+        })
+
+        const eyesReaction = reactions.data.find((r) => r.user?.login === AGENT_USERNAME)
+        if (!eyesReaction) return
+
+        await octoRest.rest.reactions.deleteForIssueComment({
+          owner,
+          repo,
+          comment_id: triggerCommentId,
+          reaction_id: eyesReaction.id,
+        })
+      }
+
+      async function createComment(body: string) {
         console.log("Creating comment...")
         return await octoRest.rest.issues.createComment({
           owner,
           repo,
           issue_number: issueId,
-          body: `[Working...](${runUrl})`,
-        })
-      }
-
-      async function updateComment(body: string) {
-        if (!commentId) return
-
-        console.log("Updating comment...")
-        return await octoRest.rest.issues.updateComment({
-          owner,
-          repo,
-          comment_id: commentId,
           body,
         })
       }
@@ -980,7 +1076,7 @@ query($owner: String!, $repo: String!, $number: Int!) {
         const comments = (issue.comments?.nodes || [])
           .filter((c) => {
             const id = parseInt(c.databaseId)
-            return id !== commentId && id !== payload.comment.id
+            return id !== payload.comment.id
           })
           .map((c) => `  - ${c.author.login} at ${c.createdAt}: ${c.body}`)
 
@@ -1099,7 +1195,7 @@ query($owner: String!, $repo: String!, $number: Int!) {
         const comments = (pr.comments?.nodes || [])
           .filter((c) => {
             const id = parseInt(c.databaseId)
-            return id !== commentId && id !== payload.comment.id
+            return id !== payload.comment.id
           })
           .map((c) => `- ${c.author.login} at ${c.createdAt}: ${c.body}`)
 

@@ -58,16 +58,13 @@ export const TuiThreadCommand = cmd({
     // Resolve relative paths against PWD to preserve behavior when using --cwd flag
     const baseCwd = process.env.PWD ?? process.cwd()
     const cwd = args.project ? path.resolve(baseCwd, args.project) : process.cwd()
-    const defaultWorker = new URL("./worker.ts", import.meta.url)
-    // Nix build creates a bundled worker next to the binary; prefer it when present.
-    const execDir = path.dirname(process.execPath)
-    const bundledWorker = path.join(execDir, "opencode-worker.js")
-    const hasBundledWorker = await Bun.file(bundledWorker).exists()
-    const workerPath = (() => {
+    const localWorker = new URL("./worker.ts", import.meta.url)
+    const distWorker = new URL("./cli/cmd/tui/worker.js", import.meta.url)
+    const workerPath = await iife(async () => {
       if (typeof OPENCODE_WORKER_PATH !== "undefined") return OPENCODE_WORKER_PATH
-      if (hasBundledWorker) return bundledWorker
-      return defaultWorker
-    })()
+      if (await Bun.file(distWorker).exists()) return distWorker
+      return localWorker
+    })
     try {
       process.chdir(cwd)
     } catch (e) {
@@ -99,7 +96,8 @@ export const TuiThreadCommand = cmd({
       if (!args.prompt) return piped
       return piped ? piped + "\n" + args.prompt : args.prompt
     })
-    await tui({
+
+    const tuiPromise = tui({
       url: server.url,
       args: {
         continue: args.continue,
@@ -112,5 +110,11 @@ export const TuiThreadCommand = cmd({
         await client.call("shutdown", undefined)
       },
     })
+
+    setTimeout(() => {
+      client.call("checkUpgrade", { directory: cwd }).catch(() => {})
+    }, 1000)
+
+    await tuiPromise
   },
 })

@@ -37,8 +37,8 @@ export namespace Plugin {
     }
 
     if (!Flag.OPENCODE_DISABLE_DEFAULT_PLUGINS) {
-      plugins.push("opencode-copilot-auth@0.0.5")
-      plugins.push("opencode-anthropic-auth@0.0.2")
+      plugins.push("opencode-copilot-auth@0.0.9")
+      plugins.push("opencode-anthropic-auth@0.0.5")
     }
     for (let plugin of plugins) {
       log.info("loading plugin", { path: plugin })

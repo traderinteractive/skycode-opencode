@@ -12,14 +12,19 @@ import type {
   McpStatus,
   FormatterStatus,
   SessionStatus,
-} from "@opencode-ai/sdk"
+  ProviderListResponse,
+  ProviderAuthMethod,
+  VcsInfo,
+} from "@opencode-ai/sdk/v2"
 import { createStore, produce, reconcile } from "solid-js/store"
 import { useSDK } from "@tui/context/sdk"
-import { Binary } from "@/util/binary"
+import { Binary } from "@opencode-ai/util/binary"
 import { createSimpleContext } from "./helper"
 import type { Snapshot } from "@/snapshot"
 import { useExit } from "./exit"
 import { batch, onMount } from "solid-js"
+import { Log } from "@/util/log"
+import type { Path } from "@opencode-ai/sdk"
 
 export const { use: useSync, provider: SyncProvider } = createSimpleContext({
   name: "Sync",
@@ -28,6 +33,8 @@ export const { use: useSync, provider: SyncProvider } = createSimpleContext({
       status: "loading" | "partial" | "complete"
       provider: Provider[]
       provider_default: Record<string, string>
+      provider_next: ProviderListResponse
+      provider_auth: Record<string, ProviderAuthMethod[]>
       agent: Agent[]
       command: Command[]
       permission: {
@@ -55,7 +62,15 @@ export const { use: useSync, provider: SyncProvider } = createSimpleContext({
         [key: string]: McpStatus
       }
       formatter: FormatterStatus[]
+      vcs: VcsInfo | undefined
+      path: Path
     }>({
+      provider_next: {
+        all: [],
+        default: {},
+        connected: [],
+      },
+      provider_auth: {},
       config: {},
       status: "loading",
       agent: [],
@@ -72,6 +87,8 @@ export const { use: useSync, provider: SyncProvider } = createSimpleContext({
       lsp: [],
       mcp: {},
       formatter: [],
+      vcs: undefined,
+      path: { state: "", config: "", worktree: "", directory: "" },
     })
 
     const sdk = useSDK()
@@ -134,7 +151,7 @@ export const { use: useSync, provider: SyncProvider } = createSimpleContext({
           }
           break
         }
-        case "session.updated":
+        case "session.updated": {
           const result = Binary.search(store.session, event.properties.info.id, (s) => s.id)
           if (result.found) {
             setStore("session", result.index, reconcile(event.properties.info))
@@ -147,6 +164,7 @@ export const { use: useSync, provider: SyncProvider } = createSimpleContext({
             }),
           )
           break
+        }
 
         case "session.status": {
           setStore("session_status", event.properties.sessionID, event.properties.status)
@@ -227,25 +245,35 @@ export const { use: useSync, provider: SyncProvider } = createSimpleContext({
           sdk.client.lsp.status().then((x) => setStore("lsp", x.data!))
           break
         }
+
+        case "vcs.branch.updated": {
+          setStore("vcs", { branch: event.properties.branch })
+          break
+        }
       }
     })
 
     const exit = useExit()
 
-    onMount(() => {
+    async function bootstrap() {
       // blocking
-      Promise.all([
-        sdk.client.config.providers({ throwOnError: true }).then((x) => {
+      await Promise.all([
+        sdk.client.config.providers({}, { throwOnError: true }).then((x) => {
           batch(() => {
             setStore("provider", x.data!.providers)
             setStore("provider_default", x.data!.default)
           })
         }),
-        sdk.client.app.agents({ throwOnError: true }).then((x) => setStore("agent", x.data ?? [])),
-        sdk.client.config.get({ throwOnError: true }).then((x) => setStore("config", x.data!)),
+        sdk.client.provider.list({}, { throwOnError: true }).then((x) => {
+          batch(() => {
+            setStore("provider_next", x.data!)
+          })
+        }),
+        sdk.client.app.agents({}, { throwOnError: true }).then((x) => setStore("agent", x.data ?? [])),
+        sdk.client.config.get({}, { throwOnError: true }).then((x) => setStore("config", x.data!)),
       ])
         .then(() => {
-          setStore("status", "partial")
+          if (store.status !== "complete") setStore("status", "partial")
           // non-blocking
           Promise.all([
             sdk.client.session.list().then((x) =>
@@ -259,15 +287,28 @@ export const { use: useSync, provider: SyncProvider } = createSimpleContext({
             sdk.client.mcp.status().then((x) => setStore("mcp", x.data!)),
             sdk.client.formatter.status().then((x) => setStore("formatter", x.data!)),
             sdk.client.session.status().then((x) => setStore("session_status", x.data!)),
+            sdk.client.provider.auth().then((x) => setStore("provider_auth", x.data ?? {})),
+            sdk.client.vcs.get().then((x) => setStore("vcs", x.data)),
+            sdk.client.path.get().then((x) => setStore("path", x.data!)),
           ]).then(() => {
             setStore("status", "complete")
           })
         })
         .catch(async (e) => {
+          Log.Default.error("tui bootstrap failed", {
+            error: e instanceof Error ? e.message : String(e),
+            name: e instanceof Error ? e.name : undefined,
+            stack: e instanceof Error ? e.stack : undefined,
+          })
           await exit(e)
         })
+    }
+
+    onMount(() => {
+      bootstrap()
     })
 
+    const fullSyncedSessions = new Set<string>()
     const result = {
       data: store,
       set: setStore,
@@ -294,16 +335,13 @@ export const { use: useSync, provider: SyncProvider } = createSimpleContext({
           return last.time.completed ? "idle" : "working"
         },
         async sync(sessionID: string) {
-          if (store.message[sessionID]) return
-          const now = Date.now()
-          console.log("syncing", sessionID)
+          if (fullSyncedSessions.has(sessionID)) return
           const [session, messages, todo, diff] = await Promise.all([
-            sdk.client.session.get({ path: { id: sessionID }, throwOnError: true }),
-            sdk.client.session.messages({ path: { id: sessionID }, query: { limit: 100 } }),
-            sdk.client.session.todo({ path: { id: sessionID } }),
-            sdk.client.session.diff({ path: { id: sessionID } }),
+            sdk.client.session.get({ sessionID }, { throwOnError: true }),
+            sdk.client.session.messages({ sessionID, limit: 100 }),
+            sdk.client.session.todo({ sessionID }),
+            sdk.client.session.diff({ sessionID }),
           ])
-          console.log("fetched in " + (Date.now() - now), sessionID)
           setStore(
             produce((draft) => {
               const match = Binary.search(draft.session, sessionID, (s) => s.id)
@@ -317,9 +355,10 @@ export const { use: useSync, provider: SyncProvider } = createSimpleContext({
               draft.session_diff[sessionID] = diff.data ?? []
             }),
           )
-          console.log("synced in " + (Date.now() - now), sessionID)
+          fullSyncedSessions.add(sessionID)
         },
       },
+      bootstrap,
     }
     return result
   },

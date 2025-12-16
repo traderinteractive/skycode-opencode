@@ -246,3 +246,50 @@ export const htmlbeautifier: Info = {
     return Bun.which("htmlbeautifier") !== null
   },
 }
+
+export const dart: Info = {
+  name: "dart",
+  command: ["dart", "format", "$FILE"],
+  extensions: [".dart"],
+  async enabled() {
+    return Bun.which("dart") !== null
+  },
+}
+
+export const ocamlformat: Info = {
+  name: "ocamlformat",
+  command: ["ocamlformat", "-i", "$FILE"],
+  extensions: [".ml", ".mli"],
+  async enabled() {
+    if (!Bun.which("ocamlformat")) return false
+    const items = await Filesystem.findUp(".ocamlformat", Instance.directory, Instance.worktree)
+    return items.length > 0
+  },
+}
+
+export const terraform: Info = {
+  name: "terraform",
+  command: ["terraform", "fmt", "$FILE"],
+  extensions: [".tf", ".tfvars"],
+  async enabled() {
+    return Bun.which("terraform") !== null
+  },
+}
+
+export const latexindent: Info = {
+  name: "latexindent",
+  command: ["latexindent", "-w", "-s", "$FILE"],
+  extensions: [".tex"],
+  async enabled() {
+    return Bun.which("latexindent") !== null
+  },
+}
+
+export const gleam: Info = {
+  name: "gleam",
+  command: ["gleam", "format", "$FILE"],
+  extensions: [".gleam"],
+  async enabled() {
+    return Bun.which("gleam") !== null
+  },
+}
