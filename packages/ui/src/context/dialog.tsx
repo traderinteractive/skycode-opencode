@@ -1,6 +1,5 @@
 import {
   createContext,
-  createEffect,
   createSignal,
   getOwner,
   Owner,
@@ -48,7 +47,6 @@ function init() {
                 open={true}
                 onOpenChange={(open) => {
                   if (!open) {
-                    console.log("closing")
                     result.close()
                   }
                 }}
@@ -71,9 +69,6 @@ function init() {
 
 export function DialogProvider(props: ParentProps) {
   const ctx = init()
-  createEffect(() => {
-    console.log("active", ctx.active)
-  })
   return (
     <Context.Provider value={ctx}>
       {props.children}

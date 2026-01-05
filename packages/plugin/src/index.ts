@@ -28,6 +28,7 @@ export type PluginInput = {
   project: Project
   directory: string
   worktree: string
+  serverUrl: URL
   $: BunShell
 }
 
@@ -153,7 +154,13 @@ export interface Hooks {
    * Called when a new message is received
    */
   "chat.message"?: (
-    input: { sessionID: string; agent?: string; model?: { providerID: string; modelID: string }; messageID?: string },
+    input: {
+      sessionID: string
+      agent?: string
+      model?: { providerID: string; modelID: string }
+      messageID?: string
+      variant?: string
+    },
     output: { message: UserMessage; parts: Part[] },
   ) => Promise<void>
   /**
@@ -190,6 +197,17 @@ export interface Hooks {
     output: {
       system: string[]
     },
+  ) => Promise<void>
+  /**
+   * Called before session compaction starts. Allows plugins to customize
+   * the compaction prompt.
+   *
+   * - `context`: Additional context strings appended to the default prompt
+   * - `prompt`: If set, replaces the default compaction prompt entirely
+   */
+  "experimental.session.compacting"?: (
+    input: { sessionID: string },
+    output: { context: string[]; prompt?: string },
   ) => Promise<void>
   "experimental.text.complete"?: (
     input: { sessionID: string; messageID: string; partID: string },

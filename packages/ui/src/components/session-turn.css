@@ -1,6 +1,5 @@
 [data-component="session-turn"] {
   /* flex: 1; */
-  --scroll-y: 0px;
   height: 100%;
   min-height: 0;
   min-width: 0;
@@ -27,7 +26,7 @@
     align-items: flex-start;
     align-self: stretch;
     min-width: 0;
-    gap: clamp(8px, calc(42px - var(--scroll-y) * 0.48), 42px);
+    gap: 28px;
     overflow-anchor: none;
   }
 
@@ -59,7 +58,7 @@
   }
 
   [data-slot="session-turn-message-content"] {
-    margin-top: -24px;
+    margin-top: -18px;
   }
 
   [data-slot="session-turn-message-title"] {
@@ -115,6 +114,12 @@
     font-size: 13px; /* text-12-medium */
     font-weight: 500;
     color: var(--text-weak);
+  }
+
+  [data-slot="session-turn-markdown"],
+  [data-slot="session-turn-accordion"] [data-slot="accordion-content"] {
+    -webkit-user-select: text;
+    user-select: text;
   }
 
   [data-slot="session-turn-markdown"] {
@@ -237,6 +242,10 @@
     justify-content: space-between;
     width: 100%;
     gap: 20px;
+
+    [data-expandable="false"] {
+      pointer-events: none;
+    }
   }
 
   [data-slot="session-turn-file-info"] {
@@ -322,6 +331,16 @@
       height: 14px;
     }
   }
+  [data-slot="session-turn-retry-message"] {
+    font-weight: 500;
+    color: var(--syntax-critical);
+  }
+  [data-slot="session-turn-retry-seconds"] {
+    color: var(--text-weak);
+  }
+  [data-slot="session-turn-retry-attempt"] {
+    color: var(--text-weak);
+  }
 
   [data-slot="session-turn-details-text"] {
     font-size: 13px; /* text-12-medium */
@@ -330,6 +349,8 @@
 
   .error-card {
     color: var(--text-on-critical-base);
+    max-height: 240px;
+    overflow-y: auto;
   }
 
   [data-slot="session-turn-collapsible-content-inner"] {
@@ -343,5 +364,13 @@
     > :first-child > [data-component="markdown"]:first-child {
       margin-top: 0;
     }
+  }
+
+  [data-slot="session-turn-permission-parts"] {
+    width: 100%;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
   }
 }

@@ -73,8 +73,24 @@ export namespace BunProc {
     })
     if (parsed.dependencies[pkg] === version) return mod
 
+    const proxied = !!(
+      process.env.HTTP_PROXY ||
+      process.env.HTTPS_PROXY ||
+      process.env.http_proxy ||
+      process.env.https_proxy
+    )
+
     // Build command arguments
-    const args = ["add", "--force", "--exact", "--cwd", Global.Path.cache, pkg + "@" + version]
+    const args = [
+      "add",
+      "--force",
+      "--exact",
+      // TODO: get rid of this case (see: https://github.com/oven-sh/bun/issues/19936)
+      ...(proxied ? ["--no-cache"] : []),
+      "--cwd",
+      Global.Path.cache,
+      pkg + "@" + version,
+    ]
 
     // Let Bun handle registry resolution:
     // - If .npmrc files exist, Bun will use them automatically
@@ -110,23 +126,5 @@ export namespace BunProc {
     parsed.dependencies[pkg] = resolvedVersion
     await Bun.write(pkgjson.name!, JSON.stringify(parsed, null, 2))
     return mod
-  }
-
-  export async function resolve(pkg: string) {
-    const local = workspace(pkg)
-    if (local) return local
-    const dir = path.join(Global.Path.cache, "node_modules", pkg)
-    const pkgjson = Bun.file(path.join(dir, "package.json"))
-    const exists = await pkgjson.exists()
-    if (exists) return dir
-  }
-
-  function workspace(pkg: string) {
-    try {
-      const target = req.resolve(`${pkg}/package.json`)
-      return path.dirname(target)
-    } catch {
-      return
-    }
   }
 }

@@ -20,8 +20,8 @@ import { LSP } from "../lsp"
 import { Format } from "../format"
 import { MessageV2 } from "../session/message-v2"
 import { TuiRoute } from "./tui"
-import { Permission } from "../permission"
 import { Instance } from "../project/instance"
+import { Project } from "../project/project"
 import { Vcs } from "../project/vcs"
 import { Agent } from "../agent/agent"
 import { Auth } from "../auth"
@@ -47,12 +47,23 @@ import { SessionStatus } from "@/session/status"
 import { upgradeWebSocket, websocket } from "hono/bun"
 import { errors } from "./error"
 import { Pty } from "@/pty"
+import { PermissionNext } from "@/permission/next"
+import { Installation } from "@/installation"
+import { MDNS } from "./mdns"
+import { Worktree } from "../worktree"
 
 // @ts-ignore This global is needed to prevent ai-sdk from logging warnings to stdout https://github.com/vercel/ai/blob/2dc67e0ef538307f21368db32d5a12345d98831b/packages/ai/src/logger/log-warnings.ts#L85
 globalThis.AI_SDK_LOG_WARNINGS = false
 
 export namespace Server {
   const log = Log.create({ service: "server" })
+
+  let _url: URL | undefined
+  let _corsWhitelist: string[] = []
+
+  export function url(): URL {
+    return _url ?? new URL("http://localhost:4096")
+  }
 
   export const Event = {
     Connected: BusEvent.define("server.connected", z.object({})),
@@ -70,6 +81,7 @@ export namespace Server {
           let status: ContentfulStatusCode
           if (err instanceof Storage.NotFoundError) status = 404
           else if (err instanceof Provider.ModelNotFoundError) status = 400
+          else if (err.name.startsWith("Worktree")) status = 400
           else status = 500
           return c.json(err.toObject(), { status })
         }
@@ -95,7 +107,48 @@ export namespace Server {
           timer.stop()
         }
       })
-      .use(cors())
+      .use(
+        cors({
+          origin(input) {
+            if (!input) return
+
+            if (input.startsWith("http://localhost:")) return input
+            if (input.startsWith("http://127.0.0.1:")) return input
+            if (input === "tauri://localhost" || input === "http://tauri.localhost") return input
+
+            // *.opencode.ai (https only, adjust if needed)
+            if (/^https:\/\/([a-z0-9-]+\.)*opencode\.ai$/.test(input)) {
+              return input
+            }
+            if (_corsWhitelist.includes(input)) {
+              return input
+            }
+
+            return
+          },
+        }),
+      )
+      .get(
+        "/global/health",
+        describeRoute({
+          summary: "Get health",
+          description: "Get health information about the OpenCode server.",
+          operationId: "global.health",
+          responses: {
+            200: {
+              description: "Health information",
+              content: {
+                "application/json": {
+                  schema: resolver(z.object({ healthy: z.literal(true), version: z.string() })),
+                },
+              },
+            },
+          },
+        }),
+        async (c) => {
+          return c.json({ healthy: true, version: Installation.VERSION })
+        },
+      )
       .get(
         "/global/event",
         describeRoute({
@@ -139,8 +192,22 @@ export namespace Server {
               })
             }
             GlobalBus.on("event", handler)
+
+            // Send heartbeat every 30s to prevent WKWebView timeout (60s default)
+            const heartbeat = setInterval(() => {
+              stream.writeSSE({
+                data: JSON.stringify({
+                  payload: {
+                    type: "server.heartbeat",
+                    properties: {},
+                  },
+                }),
+              })
+            }, 30000)
+
             await new Promise<void>((resolve) => {
               stream.onAbort(() => {
+                clearInterval(heartbeat)
                 GlobalBus.off("event", handler)
                 resolve()
                 log.info("global event disconnected")
@@ -179,7 +246,7 @@ export namespace Server {
         },
       )
       .use(async (c, next) => {
-        const directory = c.req.query("directory") ?? c.req.header("x-opencode-directory") ?? process.cwd()
+        const directory = c.req.query("directory") || c.req.header("x-opencode-directory") || process.cwd()
         return Instance.provide({
           directory,
           init: InstanceBootstrap,
@@ -546,6 +613,53 @@ export namespace Server {
           })
         },
       )
+      .post(
+        "/experimental/worktree",
+        describeRoute({
+          summary: "Create worktree",
+          description: "Create a new git worktree for the current project.",
+          operationId: "worktree.create",
+          responses: {
+            200: {
+              description: "Worktree created",
+              content: {
+                "application/json": {
+                  schema: resolver(Worktree.Info),
+                },
+              },
+            },
+            ...errors(400),
+          },
+        }),
+        validator("json", Worktree.create.schema),
+        async (c) => {
+          const body = c.req.valid("json")
+          const worktree = await Worktree.create(body)
+          return c.json(worktree)
+        },
+      )
+      .get(
+        "/experimental/worktree",
+        describeRoute({
+          summary: "List worktrees",
+          description: "List all sandbox worktrees for the current project.",
+          operationId: "worktree.list",
+          responses: {
+            200: {
+              description: "List of worktree directories",
+              content: {
+                "application/json": {
+                  schema: resolver(z.array(z.string())),
+                },
+              },
+            },
+          },
+        }),
+        async (c) => {
+          const sandboxes = await Project.sandboxes(Instance.project.id)
+          return c.json(sandboxes)
+        },
+      )
       .get(
         "/vcs",
         describeRoute({
@@ -587,13 +701,27 @@ export namespace Server {
             },
           },
         }),
+        validator(
+          "query",
+          z.object({
+            start: z.coerce
+              .number()
+              .optional()
+              .meta({ description: "Filter sessions updated on or after this timestamp (milliseconds since epoch)" }),
+            search: z.string().optional().meta({ description: "Filter sessions by title (case-insensitive)" }),
+            limit: z.coerce.number().optional().meta({ description: "Maximum number of sessions to return" }),
+          }),
+        ),
         async (c) => {
-          const sessions = await Array.fromAsync(Session.list())
-          pipe(
-            await Array.fromAsync(Session.list()),
-            filter((s) => !s.time.archived),
-            sortBy((s) => s.time.updated),
-          )
+          const query = c.req.valid("query")
+          const term = query.search?.toLowerCase()
+          const sessions: Session.Info[] = []
+          for await (const session of Session.list()) {
+            if (query.start !== undefined && session.time.updated < query.start) continue
+            if (term !== undefined && !session.title.toLowerCase().includes(term)) continue
+            sessions.push(session)
+            if (query.limit !== undefined && sessions.length >= query.limit) break
+          }
           return c.json(sessions)
         },
       )
@@ -765,9 +893,6 @@ export namespace Server {
         async (c) => {
           const sessionID = c.req.valid("param").sessionID
           await Session.remove(sessionID)
-          await Bus.publish(TuiEvent.CommandExecute, {
-            command: "session.list",
-          })
           return c.json(true)
         },
       )
@@ -913,6 +1038,7 @@ export namespace Server {
           return c.json(true)
         },
       )
+
       .post(
         "/session/:sessionID/share",
         describeRoute({
@@ -1043,17 +1169,20 @@ export namespace Server {
           z.object({
             providerID: z.string(),
             modelID: z.string(),
+            auto: z.boolean().optional().default(false),
           }),
         ),
         async (c) => {
           const sessionID = c.req.valid("param").sessionID
           const body = c.req.valid("json")
+          const session = await Session.get(sessionID)
+          await SessionRevert.cleanup(session)
           const msgs = await Session.messages({ sessionID })
-          let currentAgent = "build"
+          let currentAgent = await Agent.defaultAgent()
           for (let i = msgs.length - 1; i >= 0; i--) {
             const info = msgs[i].info
             if (info.role === "user") {
-              currentAgent = info.agent || "build"
+              currentAgent = info.agent || (await Agent.defaultAgent())
               break
             }
           }
@@ -1064,7 +1193,7 @@ export namespace Server {
               providerID: body.providerID,
               modelID: body.modelID,
             },
-            auto: false,
+            auto: body.auto,
           })
           await SessionPrompt.loop(sessionID)
           return c.json(true)
@@ -1175,6 +1304,79 @@ export namespace Server {
             messageID: params.messageID,
           })
           return c.json(message)
+        },
+      )
+      .delete(
+        "/session/:sessionID/message/:messageID/part/:partID",
+        describeRoute({
+          description: "Delete a part from a message",
+          operationId: "part.delete",
+          responses: {
+            200: {
+              description: "Successfully deleted part",
+              content: {
+                "application/json": {
+                  schema: resolver(z.boolean()),
+                },
+              },
+            },
+            ...errors(400, 404),
+          },
+        }),
+        validator(
+          "param",
+          z.object({
+            sessionID: z.string().meta({ description: "Session ID" }),
+            messageID: z.string().meta({ description: "Message ID" }),
+            partID: z.string().meta({ description: "Part ID" }),
+          }),
+        ),
+        async (c) => {
+          const params = c.req.valid("param")
+          await Session.removePart({
+            sessionID: params.sessionID,
+            messageID: params.messageID,
+            partID: params.partID,
+          })
+          return c.json(true)
+        },
+      )
+      .patch(
+        "/session/:sessionID/message/:messageID/part/:partID",
+        describeRoute({
+          description: "Update a part in a message",
+          operationId: "part.update",
+          responses: {
+            200: {
+              description: "Successfully updated part",
+              content: {
+                "application/json": {
+                  schema: resolver(MessageV2.Part),
+                },
+              },
+            },
+            ...errors(400, 404),
+          },
+        }),
+        validator(
+          "param",
+          z.object({
+            sessionID: z.string().meta({ description: "Session ID" }),
+            messageID: z.string().meta({ description: "Message ID" }),
+            partID: z.string().meta({ description: "Part ID" }),
+          }),
+        ),
+        validator("json", MessageV2.Part),
+        async (c) => {
+          const params = c.req.valid("param")
+          const body = c.req.valid("json")
+          if (body.id !== params.partID || body.messageID !== params.messageID || body.sessionID !== params.sessionID) {
+            throw new Error(
+              `Part mismatch: body.id='${body.id}' vs partID='${params.partID}', body.messageID='${body.messageID}' vs messageID='${params.messageID}', body.sessionID='${body.sessionID}' vs sessionID='${params.sessionID}'`,
+            )
+          }
+          const part = await Session.updatePart(body)
+          return c.json(part)
         },
       )
       .post(
@@ -1387,6 +1589,7 @@ export namespace Server {
         "/session/:sessionID/permissions/:permissionID",
         describeRoute({
           summary: "Respond to permission",
+          deprecated: true,
           description: "Approve or deny a permission request from the AI assistant.",
           operationId: "permission.respond",
           responses: {
@@ -1408,17 +1611,72 @@ export namespace Server {
             permissionID: z.string(),
           }),
         ),
-        validator("json", z.object({ response: Permission.Response })),
+        validator("json", z.object({ response: PermissionNext.Reply })),
         async (c) => {
           const params = c.req.valid("param")
-          const sessionID = params.sessionID
-          const permissionID = params.permissionID
-          Permission.respond({
-            sessionID,
-            permissionID,
-            response: c.req.valid("json").response,
+          PermissionNext.reply({
+            requestID: params.permissionID,
+            reply: c.req.valid("json").response,
           })
           return c.json(true)
+        },
+      )
+      .post(
+        "/permission/:requestID/reply",
+        describeRoute({
+          summary: "Respond to permission request",
+          description: "Approve or deny a permission request from the AI assistant.",
+          operationId: "permission.reply",
+          responses: {
+            200: {
+              description: "Permission processed successfully",
+              content: {
+                "application/json": {
+                  schema: resolver(z.boolean()),
+                },
+              },
+            },
+            ...errors(400, 404),
+          },
+        }),
+        validator(
+          "param",
+          z.object({
+            requestID: z.string(),
+          }),
+        ),
+        validator("json", z.object({ reply: PermissionNext.Reply, message: z.string().optional() })),
+        async (c) => {
+          const params = c.req.valid("param")
+          const json = c.req.valid("json")
+          await PermissionNext.reply({
+            requestID: params.requestID,
+            reply: json.reply,
+            message: json.message,
+          })
+          return c.json(true)
+        },
+      )
+      .get(
+        "/permission",
+        describeRoute({
+          summary: "List pending permissions",
+          description: "Get all pending permission requests across all sessions.",
+          operationId: "permission.list",
+          responses: {
+            200: {
+              description: "List of pending permissions",
+              content: {
+                "application/json": {
+                  schema: resolver(PermissionNext.Request.array()),
+                },
+              },
+            },
+          },
+        }),
+        async (c) => {
+          const permissions = await PermissionNext.list()
+          return c.json(permissions)
         },
       )
       .get(
@@ -1662,7 +1920,7 @@ export namespace Server {
         "/find/file",
         describeRoute({
           summary: "Find files",
-          description: "Search for files by name or pattern in the project directory.",
+          description: "Search for files or directories by name or pattern in the project directory.",
           operationId: "find.files",
           responses: {
             200: {
@@ -1680,15 +1938,20 @@ export namespace Server {
           z.object({
             query: z.string(),
             dirs: z.enum(["true", "false"]).optional(),
+            type: z.enum(["file", "directory"]).optional(),
+            limit: z.coerce.number().int().min(1).max(200).optional(),
           }),
         ),
         async (c) => {
           const query = c.req.valid("query").query
           const dirs = c.req.valid("query").dirs
+          const type = c.req.valid("query").type
+          const limit = c.req.valid("query").limit
           const results = await File.search({
             query,
-            limit: 10,
+            limit: limit ?? 10,
             dirs: dirs !== "false",
+            type,
           })
           return c.json(results)
         },
@@ -2094,6 +2357,27 @@ export namespace Server {
         },
       )
       .get(
+        "/experimental/resource",
+        describeRoute({
+          summary: "Get MCP resources",
+          description: "Get all available MCP resources from connected servers. Optionally filter by name.",
+          operationId: "experimental.resource.list",
+          responses: {
+            200: {
+              description: "MCP resources",
+              content: {
+                "application/json": {
+                  schema: resolver(z.record(z.string(), MCP.Resource)),
+                },
+              },
+            },
+          },
+        }),
+        async (c) => {
+          return c.json(await MCP.resources())
+        },
+      )
+      .get(
         "/lsp",
         describeRoute({
           summary: "Get LSP status",
@@ -2403,6 +2687,32 @@ export namespace Server {
           return c.json(true)
         },
       )
+      .post(
+        "/tui/select-session",
+        describeRoute({
+          summary: "Select session",
+          description: "Navigate the TUI to display the specified session.",
+          operationId: "tui.selectSession",
+          responses: {
+            200: {
+              description: "Session selected successfully",
+              content: {
+                "application/json": {
+                  schema: resolver(z.boolean()),
+                },
+              },
+            },
+            ...errors(400, 404),
+          },
+        }),
+        validator("json", TuiEvent.SessionSelect.properties),
+        async (c) => {
+          const { sessionID } = c.req.valid("json")
+          await Session.get(sessionID)
+          await Bus.publish(TuiEvent.SessionSelect, { sessionID })
+          return c.json(true)
+        },
+      )
       .route("/tui/control", TuiRoute)
       .put(
         "/auth/:providerID",
@@ -2470,8 +2780,20 @@ export namespace Server {
                 stream.close()
               }
             })
+
+            // Send heartbeat every 30s to prevent WKWebView timeout (60s default)
+            const heartbeat = setInterval(() => {
+              stream.writeSSE({
+                data: JSON.stringify({
+                  type: "server.heartbeat",
+                  properties: {},
+                }),
+              })
+            }, 30000)
+
             await new Promise<void>((resolve) => {
               stream.onAbort(() => {
+                clearInterval(heartbeat)
                 unsub()
                 resolve()
                 log.info("event disconnected")
@@ -2481,12 +2803,15 @@ export namespace Server {
         },
       )
       .all("/*", async (c) => {
-        return proxy(`https://desktop.opencode.ai${c.req.path}`, {
+        const path = c.req.path
+        const response = await proxy(`https://app.opencode.ai${path}`, {
           ...c.req,
           headers: {
-            host: "desktop.opencode.ai",
+            ...c.req.raw.headers,
+            host: "app.opencode.ai",
           },
         })
+        return response
       }),
   )
 
@@ -2504,14 +2829,45 @@ export namespace Server {
     return result
   }
 
-  export function listen(opts: { port: number; hostname: string }) {
-    const server = Bun.serve({
-      port: opts.port,
+  export function listen(opts: { port: number; hostname: string; mdns?: boolean; cors?: string[] }) {
+    _corsWhitelist = opts.cors ?? []
+
+    const args = {
       hostname: opts.hostname,
       idleTimeout: 0,
       fetch: App().fetch,
       websocket: websocket,
-    })
+    } as const
+    const tryServe = (port: number) => {
+      try {
+        return Bun.serve({ ...args, port })
+      } catch {
+        return undefined
+      }
+    }
+    const server = opts.port === 0 ? (tryServe(4096) ?? tryServe(0)) : tryServe(opts.port)
+    if (!server) throw new Error(`Failed to start server on port ${opts.port}`)
+
+    _url = server.url
+
+    const shouldPublishMDNS =
+      opts.mdns &&
+      server.port &&
+      opts.hostname !== "127.0.0.1" &&
+      opts.hostname !== "localhost" &&
+      opts.hostname !== "::1"
+    if (shouldPublishMDNS) {
+      MDNS.publish(server.port!, `opencode-${server.port!}`)
+    } else if (opts.mdns) {
+      log.warn("mDNS enabled but hostname is loopback; skipping mDNS publish")
+    }
+
+    const originalStop = server.stop.bind(server)
+    server.stop = async (closeActiveConnections?: boolean) => {
+      if (shouldPublishMDNS) MDNS.unpublish()
+      return originalStop(closeActiveConnections)
+    }
+
     return server
   }
 }
